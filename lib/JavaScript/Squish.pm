@@ -7,7 +7,7 @@ JavaScript::Squish - Reduce/Compact JavaScript code to as few characters as poss
 
 =head1 SYNOPSIS
 
- use JavaScript::Squish;
+use JavaScript::Squish;
  my $compacted = JavaScript::Squish->squish(
                      $javascript,
                      remove_comments_exceptions => qr/copyright/i )
@@ -187,6 +187,8 @@ Prior to this being called, the end of line may not terminated with a new line c
 
 The following should only cause an issue in rare and odd situations... If the input file is in dos format (line termination with "\r\n" (ie. CR LF / Carriage return Line feed)), we'll attempt to make the output the same. If you have a mixture of embeded "\r\n" and "\n" characters (not escaped, those are still safe) then this script may get confused and make them all conform to whatever is first seen in the file.
 
+The line-feed stripping isn't as thorough as it could be. It matches the behavior of JSMIN, and goes one step better with replace_extra_whitespace(), but I'm certain there are edge cases that could be optimised further. This shouldn't cause a noticable increase in size though.
+
 =head1 TODO
 
 Function and variable renaming, and other more dangerous compating techniques.
@@ -203,12 +205,16 @@ There are a few bugs, which may rear their head in some minor situations.
 
 =item Statements not terminated by semi-colon.
 
-Javascript statement that are NOT terminated by a semi-colon (";") may break once compacted, as they will be put on the same line as the following statement. In many cases, this won't be a problem, but it could cause an issue. Ex.
+These should be ok now - leaving a note here because this hasn't been thoroughly tested (I don't have any javascript to test with that meets this criteria).
+
+This would affect statements like the following:
 
     i = 5.4
     j = 42
 
-The above would become "i=5.4 j=42", and would generate an error along the lines of "expected ':' before statement".
+This used to become "i=5.4 j=42", and would generate an error along the lines of "expected ';' before statement".
+
+The linebreak should be retained now. Please let me know if you see otherwise.
 
 =item Ambiguous operator precidence
 
@@ -225,6 +231,13 @@ Still looking for them. If you find some, let us know.
 =item Latest releases, bugzilla, cvs repository, etc:
 
 https://developer.berlios.de/projects/jscompactor/
+
+=item Simlar projects:
+
+    http://crockford.com/javascript/jsmin
+    http://search.cpan.org/%7Epmichaux/JavaScript-Minifier/lib/JavaScript/Minifier.pm
+    http://dojotoolkit.org/docs/shrinksafe
+    http://dean.edwards.name/packer/
 
 =back
 
@@ -256,7 +269,7 @@ use vars qw($VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS);
 
 @EXPORT = qw( );
 
-$VERSION = '0.05';
+$VERSION = '0.07';
 
 sub squish
 {
@@ -464,8 +477,9 @@ sub extract_strings_and_comments
 
     my ($escaped, $quoteChar, $inQuote);
 
+    my $lastnws = ''; # last non-whitespace character
     my $literal = ""; # literal strings we're building
-    my $t = ""; # replacement text
+    my $t = "";       # replacement text
 
     my @lines = split(/\r?\n/, $this->data); # dos or unix... output is unix
     # step through each line
@@ -479,15 +493,8 @@ sub extract_strings_and_comments
             # look for start of string (if not in one)
             if (! $inQuote)
             {
-                if ($c eq '"' || $c eq "'")
-                {
-                    $inQuote = 1;
-                    $escaped = 0;
-                    $quoteChar = $c;
-                    $t .= $c;
-                    $literal = '';
-
-                } elsif ($c2 eq "//") {
+                # double-slash comments
+                if ($c2 eq "//") {
                     my $comment = substr($lines[$i],$j);
                     my $key_num = scalar(@{$comments});
                     $t .= "\0\0".'_'.$key_num.'_'."\0\0";
@@ -495,6 +502,7 @@ sub extract_strings_and_comments
                     push(@{$comments}, $comment);
                     next LINE;
 
+                # slash-star comments
                 } elsif ($c2 eq "/*") {
                     my $comment = "/*";
                     my $comstart = $j+2;
@@ -541,8 +549,22 @@ sub extract_strings_and_comments
                         push(@{$comments}, $comment);
                         next LINE_CHAR;
                     }
+
+                # standard quoted strings, and bare regex's
+                # "/" is considered division if it's preceeded by: )._$\ or alphanum
+                } elsif ( $c eq '"' || $c eq "'" ||
+                          ($c eq '/' && $lastnws !~ /[\)\.a-zA-Z0-9_\$\\]/) ) {
+                    $inQuote = 1;
+                    $escaped = 0;
+                    $quoteChar = $c;
+                    $t .= $c;
+                    $literal = '';
+                    $lastnws = $c unless $c =~ /\s/;
+
+                # standard code
                 } else {
                     $t .= $c;
+                    $lastnws = $c unless $c =~ /\s/;
                 }
 
             # else we're in a quote
@@ -554,13 +576,16 @@ sub extract_strings_and_comments
                     $t .= "\0\0".$key_num."\0\0";
                     $t .= $c;
                     push(@{$strings}, $literal);
+                    $lastnws = $c unless $c =~ /\s/;
 
                 } elsif ($c eq "\\" && !$escaped) {
                     $escaped = 1;
                     $literal .= $c;
+                    $lastnws = $c unless $c =~ /\s/;
                 } else {
                     $escaped = 0;
                     $literal .= $c;
+                    $lastnws = $c unless $c =~ /\s/;
                 }
             }
         }
@@ -685,27 +710,34 @@ sub join_all
         $this->extract_strings_and_comments();
     }
 
-    if (! $comment_state)
+    my $last_eol;
+    my $newdata;
+    foreach my $line (split(/\r?\n/, $this->data))
     {
-        # we're going to be restoring the comments, so we have to make sure 
-        # "//" comments are treated properly
-        $this->restore_comments();
-        my $newdata;
-        foreach my $line (split(/\r?\n/, $this->data))
+        # if we have a linebreak between these charsets (not counting spaces/other-newlines)
+        # we retain it so we don't break any code.
+        my ($first_char) = ($line =~ /^\s*(\S)/);
+        if (defined($last_eol) &&
+                ($last_eol =~ /[a-zA-Z0-9\\\$_}\])+\-"']/ || ord($last_eol) > 126) &&
+                ($first_char =~ /[a-zA-Z0-9\\\$_{[(+\-]/  || ord($first_char) > 126)    )
         {
-            $newdata .= $line;
-            if ($line =~ /\/\//) {
-                $newdata .= $this->eol_char();
-            } else {
-                $newdata .= " ";
-            }
+            $newdata .= "\n";
+        } elsif (defined $last_eol) {
+            $newdata .= " ";
         }
-        $newdata =~ s/\ $//;
-        $this->data($newdata);
 
-    } else {
-        my $data = $this->data;
-        $this->data( join(" ", split(/\r?\n/, $data) ) );
+        $newdata .= $line;
+
+        if ($line =~ /(\S)\s*$/) {
+            $last_eol = $1;
+        }
+    }
+    $newdata =~ s/\ $//;
+    $this->data($newdata);
+
+    # restore comments if they're supposed to be in here
+    unless ($comment_state) {
+        $this->restore_comments();
     }
 
     # restore strings/comments if needed
